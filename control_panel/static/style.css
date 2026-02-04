@@ -1,0 +1,147 @@
+body {
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+.status-indicator {
+    width: 12px;
+    height: 12px;
+    border-radius: 999px;
+    display: inline-block;
+    background-color: #6c757d;
+}
+
+.status-indicator.active {
+    background-color: #28a745;
+}
+
+.sensor-data {
+    font-size: 0.95rem;
+    line-height: 1.4;
+}
+
+.sensor-placeholder {
+    color: #adb5bd;
+    font-style: italic;
+}
+
+.sensor-error {
+    color: #f44336;
+    font-weight: 600;
+}
+
+.axis-x {
+    color: #2196F3;
+    font-weight: 600;
+}
+
+.axis-y {
+    color: #4CAF50;
+    font-weight: 600;
+}
+
+.axis-z {
+    color: #f44336;
+    font-weight: 600;
+}
+
+.loading {
+    animation: pulse 1.5s infinite;
+}
+
+@keyframes pulse {
+
+    0%,
+    100% {
+        opacity: 0.6;
+    }
+
+    50% {
+        opacity: 1;
+    }
+}
+
+.fallback-text {
+    font-size: 1.25rem;
+}
+
+.video-container {
+    height: 360px;
+    min-height: 240px;
+    position: relative;
+    overflow: hidden;
+}
+
+#videoStream {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
+}
+
+#placeholder {
+    position: absolute !important;
+    top: 0 !important;
+    left: 0 !important;
+    width: 100% !important;
+    height: 100% !important;
+    display: none !important;
+    overflow: hidden;
+}
+
+.placeholder-content {
+    width: 100%;
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    align-items: center;
+    text-align: center;
+    padding: 1rem;
+    box-sizing: border-box;
+}
+
+.placeholder-image-container {
+    max-height: 50%;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    margin-bottom: 1rem;
+}
+
+#staticPlaceholder {
+    max-width: 100%;
+    max-height: 100%;
+    object-fit: contain;
+    border-radius: 4px;
+}
+
+#fallbackText {
+    font-size: 1.25rem;
+    font-weight: bold;
+}
+
+.error-message ul {
+    text-align: center;
+    display: inline-block;
+    margin: 0.5rem 0 0;
+    padding-left: 1.2rem;
+}
+
+.error-message {
+    max-width: 100%;
+}
+
+@media (max-width: 768px) {
+    .video-container {
+        height: 240px;
+        min-height: 180px;
+    }
+
+    .placeholder-image-container {
+        max-height: 40%;
+    }
+
+    h1 {
+        font-size: 1.5rem;
+    }
+}
