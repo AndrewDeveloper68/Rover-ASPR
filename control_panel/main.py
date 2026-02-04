@@ -174,7 +174,10 @@ def release_control():
 @app.route("/metrics")
 def metrics():
     return jsonify(get_metrics())
-
+@app.route("/aspr_status")
+def aspr_status():
+    """Статус и объяснение АСПР для отображения в интерфейсе"""
+    return jsonify(aspr.get_aspr_explanation())
 
 if __name__ == "__main__":
     init_database()
