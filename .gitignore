@@ -4,3 +4,4 @@ venv
 __pycache__
 rover.db
 rover.wal.db
+mock_camera.jpg
