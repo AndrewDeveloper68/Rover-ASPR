@@ -3,39 +3,57 @@
 #include <WebServer.h>
 #include <ESP32Servo.h>
 #include <Wire.h>
+#include "board_config.h"
 
-// === НАСТРОЙКИ ВАШЕЙ СЕТИ ===
-const char *ssid = "ASUS";      // Замените на имя вашей сети
-const char *password = "frolov68"; // Замените на пароль вашей сети
+// === НАСТРОЙКИ СЕТИ ===
+const char *ssid = "ASUS";
+const char *password = "frolov68";
 
-#define LEFT_SERVO_PIN 48 // ЛЕВЫЙ
-#define RIGHT_SERVO_PIN 3 // ПРАВЫЙ
+// === ПИНЫ РОВЕРА ===
+#define LEFT_SERVO_PIN 48
+#define RIGHT_SERVO_PIN 3
+#define TRIG_PIN 14
+#define ECHO_PIN 2
+
+#define FWD_LEFT 40
+#define FWD_RIGHT 140
+#define BWD_LEFT 140
+#define BWD_RIGHT 40
+#define STOP_ANGLE 90
+
 Servo leftServo, rightServo;
-
-const int FWD_LEFT = 40;   // Левый вперёд
-const int FWD_RIGHT = 140; // Правый вперёд
-const int BWD_LEFT = 140;  // Левый назад
-const int BWD_RIGHT = 40;  // Правый назад
-const int STOP_ANGLE = 90;
 bool isMoving = false;
 unsigned long moveUntil = 0;
 
-#define MPU6050_ADDR 0x68
+// === MPU6050 ===
 #define MPU6050_PWR_MGMT_1 0x6B
 #define MPU6050_ACCEL_XOUT_H 0x3B
 #define MPU6050_GYRO_CONFIG 0x1B
 #define MPU6050_ACCEL_CONFIG 0x1C
-#define MPU6050_SDA_PIN 20
-#define MPU6050_SCL_PIN 21
 
-#define TRIG_PIN 14
-#define ECHO_PIN 2
+#define MPU6050_SDA_PIN 21 // ФИЗИЧЕСКИЙ SDA
+#define MPU6050_SCL_PIN 20 // ФИЗИЧЕСКИЙ SCL
 
+bool mpuPresent = false;
+uint8_t mpuAddr = 0x68; // Будем автоопределять 0x68/0x69
+
+// === HC-SR04 ===
 volatile bool echoDone = false;
 volatile unsigned long echoStart = 0;
 volatile unsigned long echoDuration = 0;
 unsigned long lastTriggerTime = 0;
 bool isMeasuring = false;
+float lastValidDistance = -1.0;
+
+// === КАМЕРА ===
+bool cameraInitialized = false;
+unsigned long lastRecoveryAttempt = 0;
+const unsigned long RECOVERY_INTERVAL = 1000; // 1 секунда
+
+WebServer server(80);
+extern void startCameraServer();
+
+// ====== HC‑SR04 ======
 
 void IRAM_ATTR echoInterrupt()
 {
@@ -70,12 +88,14 @@ float getDistanceCM_NonBlocking()
         detachInterrupt(digitalPinToInterrupt(ECHO_PIN));
         isMeasuring = false;
         echoDone = false;
-
         if (echoDuration == 0 || echoDuration > 30000)
         {
             return -1.0;
         }
-        return echoDuration * 0.0343 / 2.0; // см
+        float dist = echoDuration * 0.0343 / 2.0;
+        if (dist >= 0 && dist <= 400)
+            lastValidDistance = dist;
+        return dist;
     }
 
     if (isMeasuring && (micros() - echoStart > 30000))
@@ -85,71 +105,116 @@ float getDistanceCM_NonBlocking()
         echoDone = false;
         return -1.0;
     }
-
     return -2.0;
 }
 
-unsigned long lastSensorPrint = 0;
-const unsigned long SENSOR_PRINT_INTERVAL = 500; // 2 раза в секунду
+// ====== Сканер I2C для MPU ======
+
+void scanI2C()
+{
+    Serial.println("🔍 I2C scan на пинах SDA=SCL:");
+    Serial.printf("    SDA=%d, SCL=%d\n", MPU6050_SDA_PIN, MPU6050_SCL_PIN);
+
+    bool found = false;
+    for (uint8_t addr = 1; addr < 127; addr++)
+    {
+        Wire.beginTransmission(addr);
+        uint8_t err = Wire.endTransmission();
+        if (err == 0)
+        {
+            Serial.printf("   ➜ I2C‑устройство по адресу 0x%02X\n", addr);
+            found = true;
+        }
+    }
+    if (!found)
+    {
+        Serial.println("   ⚠️ На шине I2C ничего не найдено");
+    }
+}
+
+// ====== MPU6050: инициализация и чтение ======
 
 void initMPU6050()
 {
     Wire.begin(MPU6050_SDA_PIN, MPU6050_SCL_PIN, 400000);
     delay(100);
 
-    Wire.beginTransmission(MPU6050_ADDR);
-    uint8_t error = Wire.endTransmission();
+    scanI2C(); // для отладки: сразу видно, жив ли вообще модуль
 
-    if (error != 0)
+    // Пробуем 0x68, потом 0x69
+    uint8_t candidates[2] = {0x68, 0x69};
+    mpuPresent = false;
+
+    for (int i = 0; i < 2; i++)
     {
-        Serial.println("\nMPU6050 NOT FOUND!");
-        Serial.println("   • VCC → 3.3V (НЕ 5V!)");
-        Serial.println("   • GND → GND");
-        Serial.printf("   • SDA → GPIO%d\n", MPU6050_SDA_PIN);
-        Serial.printf("   • SCL → GPIO%d\n", MPU6050_SCL_PIN);
+        uint8_t addr = candidates[i];
+
+        Wire.beginTransmission(addr);
+        uint8_t error = Wire.endTransmission();
+
+        if (error == 0)
+        {
+            mpuAddr = addr;
+            mpuPresent = true;
+            Serial.printf("\n✅ Найден MPU6050 по адресу 0x%02X\n", mpuAddr);
+            break;
+        }
+    }
+
+    if (!mpuPresent)
+    {
+        Serial.println("\n❌ MPU6050 NOT FOUND по адресам 0x68/0x69");
+        Serial.println("   • Проверь питание 3.3V, GND, SDA/SCL, AD0");
         return;
     }
 
-    Wire.beginTransmission(MPU6050_ADDR);
+    // Инициализация по выбранному адресу
+    Wire.beginTransmission(mpuAddr);
     Wire.write(MPU6050_PWR_MGMT_1);
     Wire.write(0x00);
     Wire.endTransmission(true);
     delay(10);
 
-    Wire.beginTransmission(MPU6050_ADDR);
+    Wire.beginTransmission(mpuAddr);
     Wire.write(MPU6050_GYRO_CONFIG);
     Wire.write(0x00); // ±250°/с
     Wire.endTransmission(true);
 
-    Wire.beginTransmission(MPU6050_ADDR);
+    Wire.beginTransmission(mpuAddr);
     Wire.write(MPU6050_ACCEL_CONFIG);
     Wire.write(0x00); // ±2g
     Wire.endTransmission(true);
 
-    Serial.printf("\nMPU6050 инициализирован: 0x%02X (SDA=%d, SCL=%d)\n",
-                  MPU6050_ADDR, MPU6050_SDA_PIN, MPU6050_SCL_PIN);
+    Serial.printf("✅ MPU6050 инициализирован: addr=0x%02X (SDA=%d, SCL=%d)\n",
+                  mpuAddr, MPU6050_SDA_PIN, MPU6050_SCL_PIN);
 }
 
-bool readMPU6050(int16_t *ax, int16_t *ay, int16_t *az, int16_t *gx, int16_t *gy, int16_t *gz)
+bool readMPU6050(int16_t *ax, int16_t *ay, int16_t *az,
+                 int16_t *gx, int16_t *gy, int16_t *gz)
 {
-    Wire.beginTransmission(MPU6050_ADDR);
+    if (!mpuPresent)
+        return false;
+
+    Wire.beginTransmission(mpuAddr);
     Wire.write(MPU6050_ACCEL_XOUT_H);
     if (Wire.endTransmission(false) != 0)
         return false;
 
-    if (Wire.requestFrom(MPU6050_ADDR, 14) != 14)
+    if (Wire.requestFrom(mpuAddr, (uint8_t)14) != 14)
         return false;
 
     *ax = (Wire.read() << 8 | Wire.read());
     *ay = (Wire.read() << 8 | Wire.read());
     *az = (Wire.read() << 8 | Wire.read());
     Wire.read();
-    Wire.read(); // Температура
+    Wire.read(); // температура
     *gx = (Wire.read() << 8 | Wire.read());
     *gy = (Wire.read() << 8 | Wire.read());
     *gz = (Wire.read() << 8 | Wire.read());
     return true;
 }
+
+// ====== СЕРВЫ ======
 
 void stopServos()
 {
@@ -186,7 +251,7 @@ void moveServos(int leftAngle, int rightAngle, unsigned long durationMs)
     isMoving = true;
 }
 
-WebServer server(80);
+// ====== HTTP ======
 
 void handleCommand()
 {
@@ -230,22 +295,52 @@ void handleCommand()
 
 void handleSensor()
 {
+    // MPU6050
     int16_t ax = 0, ay = 0, az = 0, gx = 0, gy = 0, gz = 0;
     bool mpuOk = readMPU6050(&ax, &ay, &az, &gx, &gy, &gz);
 
-    static float lastValidDistance = -1.0;
+    // Ультразвук
     float distance = getDistanceCM_NonBlocking();
-
     if (distance >= 0)
     {
         lastValidDistance = distance;
     }
 
+    // ЛОГ В КОНСОЛЬ
+    static unsigned long lastPrint = 0;
+    if (millis() - lastPrint >= 500)
+    {
+        lastPrint = millis();
+        if (mpuOk)
+        {
+            Serial.printf("[IMU] aX:%5d aY:%5d aZ:%5d | gX:%5d gY:%5d gZ:%5d (addr=0x%02X)\n",
+                          ax, ay, az, gx, gy, gz, mpuAddr);
+        }
+        else if (mpuPresent)
+        {
+            Serial.println("[IMU] read_failed");
+        }
+        else
+        {
+            Serial.println("[IMU] not_detected");
+        }
+
+        if (distance >= 0)
+        {
+            Serial.printf("[ULTRASONIC] Distance: %.1f cm\n", distance);
+        }
+        else if (distance == -1.0)
+        {
+            Serial.println("[ULTRASONIC] Timeout/error");
+        }
+    }
+
+    // JSON /sensor
     String json = "{\"timestamp\":" + String(millis());
 
     if (mpuOk)
     {
-        json += ",\"imu\":{\"raw\":{\"ax\":" + String(ax) + ",\"ay\":" + String(ay) + ",\"az\":" + String(az) +
+        json += ",\"imu\":{\"status\":\"ok\",\"raw\":{\"ax\":" + String(ax) + ",\"ay\":" + String(ay) + ",\"az\":" + String(az) +
                 ",\"gx\":" + String(gx) + ",\"gy\":" + String(gy) + ",\"gz\":" + String(gz) +
                 "},\"calibrated\":{\"ax_g\":" + String(ax / 16384.0, 2) +
                 ",\"ay_g\":" + String(ay / 16384.0, 2) +
@@ -256,50 +351,36 @@ void handleSensor()
     }
     else
     {
-        json += ",\"imu\":{\"error\":\"read_failed\"}";
+        if (mpuPresent)
+        {
+            json += ",\"imu\":{\"status\":\"error\",\"error\":\"read_failed\"}";
+        }
+        else
+        {
+            json += ",\"imu\":{\"status\":\"error\",\"error\":\"not_detected\"}";
+        }
     }
 
     if (lastValidDistance >= 0)
     {
-        json += ",\"ultrasonic\":{\"distance_cm\":" + String(lastValidDistance, 1) + "}";
+        json += ",\"ultrasonic\":{\"status\":\"ok\",\"distance_cm\":" + String(lastValidDistance, 1) + "}";
     }
     else
     {
-        json += ",\"ultrasonic\":{\"error\":\"no_valid_reading_yet\"}";
+        json += ",\"ultrasonic\":{\"status\":\"error\",\"error\":\"no_valid_reading_yet\"}";
     }
 
     json += "}";
     server.send(200, "application/json", json);
 }
 
-#include "camera_index.h"
-void startCameraServer();
-void setupLedFlash();
+// ====== КАМЕРА ======
 
-void setup()
+bool initCamera()
 {
-    Serial.begin(115200);
-    Serial.println("\n==========================================");
-    Serial.println(" ESP32-S3 Rover + MPU6050 + HC-SR04");
-    Serial.println("==========================================");
-    Serial.printf("🔧 Серво: ЛЕВЫЙ=GPIO%d | ПРАВЫЙ=GPIO%d\n", LEFT_SERVO_PIN, RIGHT_SERVO_PIN);
-    Serial.printf("🔧 MPU6050: SDA=GPIO%d | SCL=GPIO%d\n", MPU6050_SDA_PIN, MPU6050_SCL_PIN);
-    Serial.printf("🔧 HC-SR04: TRIG=GPIO%d | ECHO=GPIO%d (через делитель!)\n", TRIG_PIN, ECHO_PIN);
-    Serial.println("==========================================\n");
-
-    initMPU6050();
-
-    pinMode(TRIG_PIN, OUTPUT);
-    pinMode(ECHO_PIN, INPUT);
-    digitalWrite(TRIG_PIN, LOW);
-    Serial.println("HC-SR04 инициализирован");
-
-    ESP32PWM::allocateTimer(0);
-    ESP32PWM::allocateTimer(1);
-
-    // Инициализация камеры
-#include "board_config.h"
     camera_config_t config;
+    memset(&config, 0, sizeof(config));
+
     config.ledc_channel = LEDC_CHANNEL_0;
     config.ledc_timer = LEDC_TIMER_0;
     config.pin_d0 = Y2_GPIO_NUM;
@@ -318,76 +399,126 @@ void setup()
     config.pin_sccb_scl = SIOC_GPIO_NUM;
     config.pin_pwdn = PWDN_GPIO_NUM;
     config.pin_reset = RESET_GPIO_NUM;
-    config.xclk_freq_hz = 20000000;
+    config.xclk_freq_hz = 7000000;
     config.frame_size = FRAMESIZE_QVGA;
     config.pixel_format = PIXFORMAT_JPEG;
     config.jpeg_quality = 12;
     config.fb_count = 1;
     config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
+    config.fb_location = CAMERA_FB_IN_PSRAM;
 
     if (psramFound())
     {
         config.jpeg_quality = 10;
         config.fb_count = 2;
+        config.grab_mode = CAMERA_GRAB_LATEST;
+        Serial.println("✅ PSRAM обнаружен (8 МБ)");
+    }
+    else
+    {
+        Serial.println("⚠️ PSRAM НЕ обнаружен! Проверьте: Tools → PSRAM → OPI PSRAM");
+        config.fb_location = CAMERA_FB_IN_DRAM;
+        config.frame_size = FRAMESIZE_QQVGA;
     }
 
     esp_err_t err = esp_camera_init(&config);
     if (err != ESP_OK)
     {
-        Serial.printf("\nCamera init failed: 0x%x\n", err);
-        Serial.println("   Продолжаем работу без камеры");
-    }
-    else
-    {
-        sensor_t *s = esp_camera_sensor_get();
-        s->set_framesize(s, FRAMESIZE_QVGA);
-#if defined(LED_GPIO_NUM)
-        setupLedFlash();
-#endif
-        Serial.println("\nКамера инициализирована");
+        Serial.printf("❌ Ошибка инициализации камеры (0x%x)\n", err);
+        return false;
     }
 
-    // === ПОДКЛЮЧЕНИЕ К СУЩЕСТВУЮЩЕЙ СЕТИ ===
-    Serial.print("\n📶 Подключение к Wi-Fi: ");
+    sensor_t *s = esp_camera_sensor_get();
+    if (s)
+    {
+        s->set_framesize(s, FRAMESIZE_QVGA);
+#if defined(CAMERA_MODEL_ESP32S3_EYE)
+        s->set_vflip(s, 1);
+#endif
+        Serial.println("✅ Камера инициализирована (7 МГц, QVGA)");
+    }
+
+    return true;
+}
+
+// ====== setup / loop ======
+
+void setup()
+{
+    Serial.begin(115200);
+    delay(100);
+
+    Serial.println("\n==========================================");
+    Serial.println(" ESP32-S3-EYE Rover: Камера + MPU6050 + HC-SR04");
+    Serial.println("==========================================");
+
+    Serial.printf("🔧 MPU6050: SDA=GPIO%d, SCL=GPIO%d\n", MPU6050_SDA_PIN, MPU6050_SCL_PIN);
+
+    // 1. Камера
+    Serial.println("🔧 Инициализация камеры...");
+    cameraInitialized = initCamera();
+
+    // 2. MPU6050
+    initMPU6050();
+
+    // 3. Ультразвук
+    pinMode(TRIG_PIN, OUTPUT);
+    pinMode(ECHO_PIN, INPUT);
+    digitalWrite(TRIG_PIN, LOW);
+    Serial.println("✅ HC-SR04: пины настроены");
+
+    // 4. Сервы
+    ESP32PWM::allocateTimer(0);
+    ESP32PWM::allocateTimer(1);
+    Serial.printf("✅ Сервоприводы: ЛЕВЫЙ=GPIO%d | ПРАВЫЙ=GPIO%d\n",
+                  LEFT_SERVO_PIN, RIGHT_SERVO_PIN);
+
+    // 5. Wi‑Fi
+    Serial.print("\n📶 Подключение к Wi‑Fi: ");
     Serial.println(ssid);
     WiFi.begin(ssid, password);
+    WiFi.setSleep(false);
 
-    // Ожидание подключения с таймаутом 15 секунд
     unsigned long startAttemptTime = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - startAttemptTime < 15000) {
+    while (WiFi.status() != WL_CONNECTED && millis() - startAttemptTime < 15000)
+    {
         Serial.print(".");
         delay(500);
     }
 
-    if (WiFi.status() != WL_CONNECTED) {
-        Serial.println("\n❌ Ошибка подключения к Wi-Fi!");
-        Serial.println("   Проверьте правильность SSID и пароля");
-        // Продолжаем работу без сети (серво и датчики всё ещё работают)
-    } else {
-        Serial.println("\n✅ Wi-Fi подключён!");
+    if (WiFi.status() != WL_CONNECTED)
+    {
+        Serial.println("\n❌ Ошибка подключения к Wi‑Fi!");
+    }
+    else
+    {
+        Serial.println("\n✅ Wi‑Fi подключён!");
         Serial.print("🌐 IP адрес: ");
         Serial.println(WiFi.localIP());
+        Serial.println("   • Управление: http://<IP>/cmd?move=forward|backward|left|right|stop");
+        Serial.println("   • Датчики:    http://<IP>/sensor");
+        Serial.println("   • Камера:     http://<IP>:81/stream");
+        Serial.println("   • Снимок:     http://<IP>/capture");
     }
 
-    // Роутинг
+    // 6. HTTP
     server.on("/cmd", HTTP_GET, handleCommand);
     server.on("/sensor", HTTP_GET, handleSensor);
-    server.on("/stream", HTTP_GET, []()
-              { server.sendContent(""); });
     server.begin();
+    Serial.println("✅ WebServer запущен на порту 80 (/cmd, /sensor)");
 
-    if (err == ESP_OK)
+    // 7. Сервер камеры
+    if (cameraInitialized)
+    {
         startCameraServer();
+    }
+    else
+    {
+        Serial.println("⚠️ Сервер камеры НЕ запущен (камера не инициализирована)");
+    }
 
     Serial.println("\n==========================================");
-    Serial.println("Rover API готов к работе:");
-    Serial.println("   • Управление: /cmd?move=forward|backward|left|right|stop");
-    Serial.println("   • Датчики:   /sensor → JSON (IMU + ультразвук)");
-    Serial.println("   • Камера:    /stream → видеопоток MJPEG");
-    Serial.println("==========================================");
-    Serial.println("\nВАЖНО ДЛЯ HC-SR04:");
-    Serial.println("   • Питание датчика — ТОЛЬКО от внешнего 5В!");
-    Serial.println("   • Echo → GPIO2 ТОЛЬКО через делитель 10к+20к!");
+    Serial.println("✅ Система готова к работе");
     Serial.println("==========================================\n");
 }
 
@@ -397,29 +528,25 @@ void loop()
 
     if (isMoving && millis() >= moveUntil)
     {
-        Serial.println("[AUTO] ⏹ Автоостановка по таймеру");
+        Serial.println("[AUTO] ⏹ Автоостановка сервоприводов");
         stopServos();
     }
 
-    if (millis() - lastSensorPrint >= SENSOR_PRINT_INTERVAL)
+    getDistanceCM_NonBlocking();
+
+    if (!cameraInitialized && millis() - lastRecoveryAttempt > RECOVERY_INTERVAL)
     {
-        lastSensorPrint = millis();
-
-        int16_t ax, ay, az, gx, gy, gz;
-        if (readMPU6050(&ax, &ay, &az, &gx, &gy, &gz))
+        lastRecoveryAttempt = millis();
+        Serial.println("\n🔄 Попытка восстановления камеры...");
+        esp_camera_deinit();
+        delay(100);
+        cameraInitialized = initCamera();
+        if (cameraInitialized)
         {
-            Serial.printf("[IMU] aX:%5d aY:%5d aZ:%5d | gX:%5d gY:%5d gZ:%5d\n",
-                          ax, ay, az, gx, gy, gz);
-        }
-
-        float dist = getDistanceCM_NonBlocking();
-        if (dist >= 0)
-        {
-            Serial.printf("[ULTRASONIC] Distance: %.1f cm\n", dist);
-        }
-        else if (dist == -1.0)
-        {
-            Serial.println("[ULTRASONIC] Timeout/error");
+            Serial.println("✅ Камера восстановлена!");
+            startCameraServer();
         }
     }
+
+    delay(10);
 }
