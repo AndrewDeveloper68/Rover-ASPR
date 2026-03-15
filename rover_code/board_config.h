@@ -5,7 +5,6 @@
 // Select camera model
 // ===================
 #define CAMERA_MODEL_ESP32S3_EYE  // Единственная раскомментированная модель
-
 #if defined(CAMERA_MODEL_WROVER_KIT)
 #define PWDN_GPIO_NUM  -1
 #define RESET_GPIO_NUM -1

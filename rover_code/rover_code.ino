@@ -11,7 +11,7 @@ const char *password = "frolov68";
 
 // === ПИНЫ РОВЕРА ===
 #define LEFT_SERVO_PIN 48
-#define RIGHT_SERVO_PIN 3
+#define RIGHT_SERVO_PIN 1
 #define TRIG_PIN 14
 #define ECHO_PIN 2
 

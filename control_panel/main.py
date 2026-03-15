@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 # Настройки подключения к ESP32
-ESP32_IP = "192.168.1.187"
+ESP32_IP = "192.168.1.93"
 ESP32_CMD_URL = f"http://{ESP32_IP}/cmd"
 ESP32_SENSOR_URL = f"http://{ESP32_IP}/sensor"
 ESP32_STREAM_URL = f"http://{ESP32_IP}:81/stream"
@@ -208,19 +208,14 @@ def video_feed():
                 ts = latest_frame_ts
 
             if frame is None:
-                # камера ещё не выдала ни одного кадра
                 time.sleep(0.1)
                 continue
-
-            # если кадр слишком старый, можно подождать новый (опционально)
             if time.time() - ts > 5.0:
                 logger.warning("⚠️ Слишком старый кадр, ожидаю обновление")
                 time.sleep(0.1)
                 continue
 
-            # отдаём текущий последний кадр
             yield (b"--frame\r\n" b"Content-Type: image/jpeg\r\n\r\n" + frame + b"\r\n")
-            # ограничение FPS для клиентов
             time.sleep(0.04)  # ~25 fps
 
     return Response(
