@@ -17,16 +17,103 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 # Настройки подключения к ESP32
-ESP32_IP = "127.0.0.1"
-ESP32_CMD_URL = f"http://{ESP32_IP}:5000/cmd"
-ESP32_SENSOR_URL = f"http://{ESP32_IP}:5000/sensor"
-ESP32_STREAM_URL = f"http://{ESP32_IP}:5000/stream"
+ESP32_IP = "192.168.1.93"
+ESP32_CMD_URL = f"http://{ESP32_IP}/cmd"
+ESP32_SENSOR_URL = f"http://{ESP32_IP}/sensor"
+ESP32_STREAM_URL = f"http://{ESP32_IP}:81/stream"
 
 # Глобальное состояние
 latest_sensor_data = {}
 sensor_lock = threading.Lock()
 current_operator = None
 operator_lock = threading.Lock()
+
+latest_jpeg_frame = None
+frame_lock = threading.Lock()
+latest_frame_ts = 0.0
+
+
+def camera_reader():
+    """Читает MJPEG-поток от ESP32-CAM, извлекает кадры и кладёт последний JPEG в глобалку."""
+    global latest_jpeg_frame, latest_frame_ts
+    buffer = b""
+    logger.info("📹 Запущен фоновый поток camera_reader (парсинг MJPEG)")
+
+    # для стандартного Arduino CameraWebServer:
+    boundary = b"--123456789000000000000987654321"
+
+    while True:
+        try:
+            resp = requests.get(
+                ESP32_STREAM_URL,
+                stream=True,
+                timeout=15,
+                headers={
+                    "User-Agent": "Flask-Cache/1.0",
+                    "Accept": "multipart/x-mixed-replace",
+                },
+            )
+            logger.info(
+                f"✅ Подключено к камере. Content-Type: {resp.headers.get('Content-Type', 'unknown')}"
+            )
+
+            for chunk in resp.iter_content(chunk_size=4096):
+                if not chunk:
+                    continue
+                buffer += chunk
+
+                # Ищем начало текущего кадра
+                start = buffer.find(boundary + b"\r\n")
+                if start == -1:
+                    # boundary ещё не полностью в буфере
+                    # ограничим размер буфера, чтобы не раздувался до бесконечности
+                    if len(buffer) > 1024 * 1024:
+                        buffer = buffer[-1024 * 1024 :]
+                    continue
+
+                # Ищем начало следующего кадра
+                next_start = buffer.find(boundary + b"\r\n", start + len(boundary) + 2)
+                if next_start == -1:
+                    # нет следующего boundary — ждём ещё данных
+                    continue
+
+                frame_section = buffer[start:next_start]
+
+                # Внутри фрагмента ищем конец HTTP-заголовков
+                header_end = frame_section.find(b"\r\n\r\n")
+                if header_end == -1:
+                    # заголовки не полные
+                    buffer = buffer[next_start:]
+                    continue
+
+                jpg_data = frame_section[header_end + 4 :]
+
+                # На всякий случай режем по EOI JPEG
+                end_marker = jpg_data.find(b"\xff\xd9")
+                if end_marker != -1:
+                    jpg_data = jpg_data[: end_marker + 2]
+
+                if jpg_data:
+                    with frame_lock:
+                        latest_jpeg_frame = jpg_data
+                        latest_frame_ts = time.time()
+                    logger.debug(f"📸 Кадр сохранён! Размер: {len(jpg_data)} байт")
+
+                # Выбрасываем всё до начала следующего кадра
+                buffer = buffer[next_start:]
+
+            resp.close()
+            logger.warning("⚠️ Поток от камеры закрыт, переподключаюсь...")
+
+        except requests.exceptions.Timeout:
+            logger.error("⏰ Таймаут подключения к камере")
+        except requests.exceptions.ConnectionError:
+            logger.error("🔌 Разрыв соединения с камерой")
+        except Exception as e:
+            logger.exception(f"💥 Ошибка в camera_reader: {e}")
+        finally:
+            buffer = b""
+            time.sleep(1)
 
 
 def background_logger():
@@ -59,7 +146,7 @@ def background_logger():
                 if aspr_result:
                     save_command("stop", "aspr", None, aspr_result["reason"])
 
-            time.sleep(0.5)
+            time.sleep(0.2)
         except Exception as e:
             logger.error(f"Ошибка фонового сбора: {e}")
             time.sleep(1)
@@ -114,24 +201,27 @@ def sensor_proxy():
 @app.route("/video_feed")
 def video_feed():
     def generate():
-        try:
-            resp = requests.get(ESP32_STREAM_URL, stream=True, timeout=5.0)
-            resp.raise_for_status()
-            for chunk in resp.iter_content(chunk_size=10240):
-                if chunk:
-                    yield chunk
-        except Exception as e:
-            logger.warning(f"Ошибка видеопотока: {e}")
-            placeholder_path = os.path.join(app.static_folder, "no_signal.png")
-            with open(placeholder_path, "rb") as f:
-                img_bytes = f.read()
-            while True:
-                yield (
-                    b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + img_bytes + b"\r\n"
-                )
-                time.sleep(1)
+        while True:
+            # ждём, пока появится хоть какой-то кадр
+            with frame_lock:
+                frame = latest_jpeg_frame
+                ts = latest_frame_ts
 
-    return Response(generate(), mimetype="multipart/x-mixed-replace; boundary=frame")
+            if frame is None:
+                time.sleep(0.1)
+                continue
+            if time.time() - ts > 5.0:
+                logger.warning("⚠️ Слишком старый кадр, ожидаю обновление")
+                time.sleep(0.1)
+                continue
+
+            yield (b"--frame\r\n" b"Content-Type: image/jpeg\r\n\r\n" + frame + b"\r\n")
+            time.sleep(0.04)  # ~25 fps
+
+    return Response(
+        generate(),
+        mimetype="multipart/x-mixed-replace; boundary=frame",
+    )
 
 
 @app.route("/control")
@@ -176,16 +266,23 @@ def metrics():
     return jsonify(get_metrics())
 
 
+@app.route("/aspr_status")
+def aspr_status():
+    """Статус и объяснение АСПР для отображения в интерфейсе"""
+    return jsonify(aspr.get_aspr_explanation())
+
+
 if __name__ == "__main__":
     init_database()
     aspr.init_aspr(ESP32_CMD_URL)
 
     # Запуск фоновых потоков
     threading.Thread(target=background_logger, daemon=True).start()
+    threading.Thread(target=camera_reader, daemon=True).start()
     threading.Thread(
         target=lambda: [time.sleep(2) or save_to_disk() for _ in iter(int, 1)],
         daemon=True,
     ).start()
 
-    logger.info("🚀 Flask-сервер запущен на http://0.0.0.0:80")
+    logger.info("Flask-сервер запущен на http://0.0.0.0:80")
     app.run(host="0.0.0.0", port=80, debug=False, threaded=True)

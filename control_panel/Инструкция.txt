@@ -1,4 +1,5 @@
 Для запуска Веб-Сервера нужно находясь в папке control_panel:
+cd "C:\Users\Andrew\PycharmProjects\Rover-ASPR\control_panel"
 1) Ввести в консоль:
 
 ```cmd
@@ -22,13 +23,18 @@ python -m pip install --upgrade pip
 ```cmd
 pip install -r requirements.txt
 ```
+pip install joblib scikit-learn
+
 
 5) Ввести в консоль:
 
 ```cmd
 python main.py
 ```
+,л
 
+
+  5
 6) Запустить луноход с прошивкой прилагаемой к нему
 
 7) Подключиться к WiFi Лунохода
